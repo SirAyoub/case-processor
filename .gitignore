@@ -1,0 +1,25 @@
+# Go
+*.o
+*.a
+*.so
+*.exe
+case-processor
+*.test
+vendor/
+/bin/
+**/bin/
+/server
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+coverage.out
+coverage.html
+*.coverprofile
+.env
+.env.*
+!.env.example
+tmp/
+dist/
+*.log
