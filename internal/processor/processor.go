@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -113,11 +114,14 @@ func (p *Processor) processCase(ctx context.Context, c models.Case) error {
 	// Setup temp directory for this case
 	caseID := strings.TrimSuffix(filepath.Base(c.FileName), ".pdf")
 	tempDir := filepath.Join(p.cfg.TempDir, caseID)
-	//defer os.RemoveAll(tempDir) // Cleanup on finish
+	defer os.RemoveAll(tempDir) // Cleanup on finish
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		return fmt.Errorf("create output dir: %w", err)
+	}
 
 	// Step 1: Download PDF from MinIO
-	pdfPath := filepath.Join(p.cfg.TempDir, caseID+".pdf")
-	//defer os.Remove(pdfPath)
+	pdfPath := filepath.Join(tempDir, caseID+".pdf")
+	defer os.Remove(pdfPath)
 
 	logger.Info("downloading PDF")
 	if err := p.minio.DownloadPDF(ctx, c.FileName, pdfPath); err != nil {
