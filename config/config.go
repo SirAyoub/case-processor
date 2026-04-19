@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -17,9 +18,10 @@ type Config struct {
 	MinioUseSSL    bool
 
 	// Ollama
-	OllamaEndpoint      string
-	OllamaModel         string
-	OllamaMaxPagesChunk int
+	OllamaEndpoint       string
+	OllamaModel          string
+	OllamaMaxPagesChunk  int
+	OllamaTimeoutPerPage time.Duration
 
 	// Database
 	DBHost     string
@@ -29,34 +31,37 @@ type Config struct {
 	DBPassword string
 
 	// Processing
-	TempDir            string
-	MaxRetries         int
-	ConcurrentWorkers  int
-	PDFDPI             int
+	TempDir           string
+	MaxRetries        int
+	ConcurrentWorkers int
+	PDFDPI            int
 }
 
 func Load() (*Config, error) {
 	// Load .env file (ignore error if not exists - use env vars directly)
 	_ = godotenv.Load()
 
+	timeoutSecs := getEnvInt("OLLAMA_TIMEOUT_PER_PAGE_SECONDS", 180)
+
 	cfg := &Config{
-		MinioEndpoint:       getEnv("MINIO_ENDPOINT", "localhost:9000"),
-		MinioAccessKey:      mustEnv("MINIO_ACCESS_KEY"),
-		MinioSecretKey:      mustEnv("MINIO_SECRET_KEY"),
-		MinioBucket:         getEnv("MINIO_BUCKET", "Cases"),
-		MinioUseSSL:         getEnvBool("MINIO_USE_SSL", false),
-		OllamaEndpoint:      getEnv("OLLAMA_ENDPOINT", "http://localhost:11434"),
-		OllamaModel:         getEnv("OLLAMA_MODEL", "gemma4"),
-		OllamaMaxPagesChunk: getEnvInt("OLLAMA_MAX_PAGES_PER_CHUNK", 30),
-		DBHost:              getEnv("DB_HOST", "localhost"),
-		DBPort:              getEnvInt("DB_PORT", 1433),
-		DBName:              mustEnv("DB_NAME"),
-		DBUser:              mustEnv("DB_USER"),
-		DBPassword:          mustEnv("DB_PASSWORD"),
-		TempDir:             getEnv("TEMP_DIR", "/tmp/case-processor"),
-		MaxRetries:          getEnvInt("MAX_RETRIES", 2),
-		ConcurrentWorkers:   getEnvInt("CONCURRENT_WORKERS", 2),
-		PDFDPI:              getEnvInt("PDF_DPI", 200),
+		MinioEndpoint:        getEnv("MINIO_ENDPOINT", "localhost:9000"),
+		MinioAccessKey:       mustEnv("MINIO_ACCESS_KEY"),
+		MinioSecretKey:       mustEnv("MINIO_SECRET_KEY"),
+		MinioBucket:          getEnv("MINIO_BUCKET", "Cases"),
+		MinioUseSSL:          getEnvBool("MINIO_USE_SSL", false),
+		OllamaEndpoint:       getEnv("OLLAMA_ENDPOINT", "http://localhost:11434"),
+		OllamaModel:          getEnv("OLLAMA_MODEL", "gemma4"),
+		OllamaMaxPagesChunk:  getEnvInt("OLLAMA_MAX_PAGES_PER_CHUNK", 30),
+		OllamaTimeoutPerPage: time.Duration(timeoutSecs) * time.Second,
+		DBHost:               getEnv("DB_HOST", "localhost"),
+		DBPort:               getEnvInt("DB_PORT", 1433),
+		DBName:               mustEnv("DB_NAME"),
+		DBUser:               mustEnv("DB_USER"),
+		DBPassword:           mustEnv("DB_PASSWORD"),
+		TempDir:              getEnv("TEMP_DIR", "/tmp/case-processor"),
+		MaxRetries:           getEnvInt("MAX_RETRIES", 2),
+		ConcurrentWorkers:    getEnvInt("CONCURRENT_WORKERS", 2),
+		PDFDPI:               getEnvInt("PDF_DPI", 200),
 	}
 
 	return cfg, nil

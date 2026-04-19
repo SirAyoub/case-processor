@@ -15,18 +15,22 @@ import (
 )
 
 type Client struct {
-	endpoint string
-	model    string
-	http     *http.Client
+	endpoint       string
+	model          string
+	http           *http.Client
+	timeoutPerPage time.Duration
 }
 
 func New(endpoint, model string) *Client {
+	return NewWithTimeout(endpoint, model, 3*time.Minute)
+}
+
+func NewWithTimeout(endpoint, model string, timeoutPerPage time.Duration) *Client {
 	return &Client{
-		endpoint: endpoint,
-		model:    model,
-		http: &http.Client{
-			Timeout: 10 * time.Minute, // Vision inference can be slow
-		},
+		endpoint:       endpoint,
+		model:          model,
+		http:           &http.Client{Timeout: 0}, // no global timeout — handled per-request
+		timeoutPerPage: timeoutPerPage,
 	}
 }
 
@@ -138,11 +142,47 @@ func buildExtractionPrompt(isChunk bool, chunkNum, totalChunks int) string {
 
 // ─── Main Extraction Function ─────────────────────────────────────────────────
 
-// ExtractCaseData sends pages to Ollama and returns structured case data
+// ExtractCaseData sends pages to Ollama with retry + dynamic timeout.
+// Timeout = 5 min base + 3 min × number of pages.
 func (c *Client) ExtractCaseData(ctx context.Context, pages []pdf.PageImage, chunkNum, totalChunks int) (*models.CaseJSON, error) {
-	isChunk := totalChunks > 1
+	const maxAttempts = 3
 
-	// Build images list (base64 only, no prefix - Ollama handles it)
+	// Dynamic timeout based on page count
+	// 30 pages → 5 + 90 = 95 minutes
+	dynamicTimeout := 5*time.Minute + time.Duration(len(pages))*c.timeoutPerPage
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			// Exponential backoff: 30s, 120s
+			backoff := time.Duration(attempt*attempt) * 30 * time.Second
+			fmt.Printf("[ollama] chunk %d: waiting %v before retry %d/%d\n", chunkNum, backoff, attempt, maxAttempts)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+
+		reqCtx, cancel := context.WithTimeout(ctx, dynamicTimeout)
+		fmt.Printf("[ollama] chunk %d/%d: attempt %d, pages=%d, timeout=%v\n",
+			chunkNum, totalChunks, attempt, len(pages), dynamicTimeout)
+
+		result, err := c.doRequest(reqCtx, pages, chunkNum, totalChunks)
+		cancel()
+
+		if err == nil {
+			return result, nil
+		}
+
+		lastErr = err
+		fmt.Printf("[ollama] chunk %d attempt %d failed: %v\n", chunkNum, attempt, err)
+	}
+
+	return nil, fmt.Errorf("all %d attempts failed, last: %w", maxAttempts, lastErr)
+}
+
+func (c *Client) doRequest(ctx context.Context, pages []pdf.PageImage, chunkNum, totalChunks int) (*models.CaseJSON, error) {
 	images := make([]string, len(pages))
 	for i, p := range pages {
 		images[i] = p.Base64
@@ -152,17 +192,14 @@ func (c *Client) ExtractCaseData(ctx context.Context, pages []pdf.PageImage, chu
 		Model:  c.model,
 		Stream: false,
 		Options: map[string]any{
-			"temperature": 0.1, // Low temperature for consistent structured output
+			"temperature": 0.1,
 			"num_ctx":     32768,
 		},
 		Messages: []ollamaMessage{
-			{
-				Role:    "system",
-				Content: systemPrompt,
-			},
+			{Role: "system", Content: systemPrompt},
 			{
 				Role:    "user",
-				Content: buildExtractionPrompt(isChunk, chunkNum, totalChunks),
+				Content: buildExtractionPrompt(totalChunks > 1, chunkNum, totalChunks),
 				Images:  images,
 			},
 		},
@@ -182,9 +219,14 @@ func (c *Client) ExtractCaseData(ctx context.Context, pages []pdf.PageImage, chu
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("ollama request: %w", err)
+		return nil, fmt.Errorf("http: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b[:min(200, len(b))]))
+	}
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -193,7 +235,7 @@ func (c *Client) ExtractCaseData(ctx context.Context, pages []pdf.PageImage, chu
 
 	var ollamaResp ollamaResponse
 	if err := json.Unmarshal(respBody, &ollamaResp); err != nil {
-		return nil, fmt.Errorf("unmarshal response: %w\nBody: %s", err, string(respBody[:min(200, len(respBody))]))
+		return nil, fmt.Errorf("unmarshal: %w\nBody: %s", err, string(respBody[:min(200, len(respBody))]))
 	}
 
 	if ollamaResp.Error != "" {
@@ -203,35 +245,46 @@ func (c *Client) ExtractCaseData(ctx context.Context, pages []pdf.PageImage, chu
 	return parseJSON(ollamaResp.Message.Content)
 }
 
-// parseJSON extracts and parses JSON from AI response
-// Handles cases where model adds text around JSON
+// ─── JSON Parsing ─────────────────────────────────────────────────────────────
+
 func parseJSON(content string) (*models.CaseJSON, error) {
 	content = strings.TrimSpace(content)
 
-	// Try to find JSON block if model added extra text
-	if start := strings.Index(content, "{"); start != -1 {
-		if end := strings.LastIndex(content, "}"); end != -1 && end >= start {
-			content = content[start : end+1]
+	// Strip ```json ... ``` fences if model added them
+	if strings.Contains(content, "```") {
+		start := strings.Index(content, "\n")
+		end := strings.LastIndex(content, "```")
+		if start != -1 && end > start {
+			content = strings.TrimSpace(content[start+1 : end])
+		}
+	}
+
+	// Find outermost { ... }
+	if s := strings.Index(content, "{"); s != -1 {
+		if e := strings.LastIndex(content, "}"); e >= s {
+			content = content[s : e+1]
 		}
 	}
 
 	var result models.CaseJSON
 	if err := json.Unmarshal([]byte(content), &result); err != nil {
-		return nil, fmt.Errorf("parse JSON from AI: %w\nContent: %s", err, content[:min(300, len(content))])
+		preview := content
+		if len(preview) > 400 {
+			preview = preview[:400]
+		}
+		return nil, fmt.Errorf("parse JSON: %w\nPreview: %s", err, preview)
 	}
 	return &result, nil
 }
 
-// MergeChunks merges multiple CaseJSON results from chunked processing
-// First chunk has the case metadata; all chunks contribute defendants and verdicts
+// ─── Chunk Merging ────────────────────────────────────────────────────────────
+
 func MergeChunks(chunks []*models.CaseJSON) *models.CaseJSON {
 	if len(chunks) == 0 {
 		return &models.CaseJSON{}
 	}
+	merged := *chunks[0]
 
-	merged := *chunks[0] // First chunk has the header info
-
-	// Deduplicate defendants by name
 	defMap := make(map[string]models.Defendant)
 	for _, chunk := range chunks {
 		for _, d := range chunk.Defendants {
@@ -245,7 +298,6 @@ func MergeChunks(chunks []*models.CaseJSON) *models.CaseJSON {
 		merged.Defendants = append(merged.Defendants, d)
 	}
 
-	// Deduplicate verdicts by verdict text
 	verdictMap := make(map[string]models.Verdict)
 	for _, chunk := range chunks {
 		for _, v := range chunk.Verdicts {
